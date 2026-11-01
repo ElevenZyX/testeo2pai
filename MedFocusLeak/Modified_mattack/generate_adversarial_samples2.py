@@ -8,6 +8,7 @@ import torch
 import torchvision
 from PIL import Image
 import os
+import hydra
 from config_schema import MainConfig
 from functools import partial
 from typing import List, Dict, Optional
@@ -102,6 +103,7 @@ class ImageFolderWithPaths(torchvision.datasets.ImageFolder):
         return original_tuple + (path,)
 
 
+@hydra.main(version_base=None, config_path="config", config_name="ensemble_3models")
 def main(cfg: MainConfig):
     set_environment()
 
@@ -210,14 +212,10 @@ def attack_imgpair(
         folder_to_save = os.path.join(cfg.data.output, "img", config_hash, folder)
         ensure_dir(folder_to_save)
 
-        if "JPEG" in name:
-            torchvision.utils.save_image(
-                adv_image[path_idx], os.path.join(folder_to_save, name[:-4]) + "png"
-            )
-        elif "png" in name:
-            torchvision.utils.save_image(
-                adv_image[path_idx], os.path.join(folder_to_save, name)
-            )
+        base_name, _ = os.path.splitext(name)
+        torchvision.utils.save_image(
+            adv_image[path_idx], os.path.join(folder_to_save, base_name + ".png")
+        )
 
 
 def fgsm_attack(
@@ -451,5 +449,4 @@ def pgd_attack(
 
 
 if __name__ == "__main__":
-    cfg = MainConfig()
-    main(cfg)
+    main()
