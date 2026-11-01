@@ -29,8 +29,6 @@ conda activate pai2
 export HF_HOME=~/hf_cache
 export WANDB_MODE=disabled
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# Si necesitas token de HuggingFace, descomenta la siguiente linea o haz `huggingface-cli login` antes:
-# export HF_TOKEN="tu_token_hf_aqui"
 
 REPO_DIR=$(pwd)
 
@@ -44,9 +42,17 @@ mkdir -p "${WORK_DIR}/attentionshift_imgs/1"
 mkdir -p "${WORK_DIR}/attentionshift_results"
 mkdir -p "${WORK_DIR}/output"
 
-# Rutas de entrada por modalidad (ajusta DATA_CSV si tienes un CSV global)
 DATA_CSV="${REPO_DIR}/data_${SPLIT}.csv"
 MODIFIED_CSV="${WORK_DIR}/modified_${SPLIT}.csv"
+
+echo "=== [Paso 0/7] Preparando imagenes, mascaras y CSV base para ${SPLIT} ==="
+python "${REPO_DIR}/prepare_split.py" \
+    --split "${SPLIT}" \
+    --repo_dir "${REPO_DIR}" \
+    --work_dir "${WORK_DIR}" \
+    --output_csv "${DATA_CSV}" \
+    --vlm_model "Qwen/Qwen2.5-VL-7B-Instruct"
+# Al terminar este comando, el proceso de Python se cierra y libera el 100% de la VRAM.
 
 echo "=== [Paso 1/7] Generando texto adversarial con Qwen/Qwen2.5-14B-Instruct ==="
 python "${REPO_DIR}/MedFocusLeak/DataProcessing/Adv_Text.py" \
@@ -119,4 +125,3 @@ python gpt_evaluate.py \
 echo "=========================================="
 echo "=== Finalizado $SPLIT. Resultados en: ${WORK_DIR}/output/export_bundle ==="
 echo "=========================================="
-
