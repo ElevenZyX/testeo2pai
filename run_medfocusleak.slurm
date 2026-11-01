@@ -38,8 +38,6 @@ mkdir -p "${WORK_DIR}/white_images/1"
 mkdir -p "${WORK_DIR}/bsa_output/1"
 mkdir -p "${WORK_DIR}/clean_images/1"
 mkdir -p "${WORK_DIR}/masks/1"
-mkdir -p "${WORK_DIR}/attentionshift_imgs/1"
-mkdir -p "${WORK_DIR}/attentionshift_results"
 mkdir -p "${WORK_DIR}/output"
 
 DATA_CSV="${REPO_DIR}/data_${SPLIT}.csv"
@@ -52,7 +50,6 @@ python "${REPO_DIR}/prepare_split.py" \
     --work_dir "${WORK_DIR}" \
     --output_csv "${DATA_CSV}" \
     --vlm_model "Qwen/Qwen2.5-VL-7B-Instruct"
-# Al terminar este comando, el proceso de Python se cierra y libera el 100% de la VRAM.
 
 echo "=== [Paso 1/7] Generando texto adversarial con Qwen/Qwen2.5-14B-Instruct ==="
 python "${REPO_DIR}/MedFocusLeak/DataProcessing/Adv_Text.py" \
@@ -60,24 +57,31 @@ python "${REPO_DIR}/MedFocusLeak/DataProcessing/Adv_Text.py" \
     --output_csv "${MODIFIED_CSV}" \
     --k 5 \
     --model_name "Qwen/Qwen2.5-14B-Instruct"
-# Al terminar este comando, el proceso de Python se cierra y libera el 100% de la VRAM.
 
 echo "=== [Paso 2/7] Renderizando texto adversarial en imagenes blancas ==="
-python "${REPO_DIR}/MedFocusLeak/DataProcessing/White_Img.py" \
-    --csv "${MODIFIED_CSV}" \
-    --out_dir "${WORK_DIR}/white_images/1" \
-    --limit 1000
+if [ -z "$(ls -A "${WORK_DIR}/white_images/1" 2>/dev/null)" ]; then
+    python "${REPO_DIR}/MedFocusLeak/DataProcessing/White_Img.py" \
+        --csv "${MODIFIED_CSV}" \
+        --out_dir "${WORK_DIR}/white_images/1" \
+        --limit 1000
+else
+    echo "Imagenes blancas ya existen en ${WORK_DIR}/white_images/1, saltando Paso 2."
+fi
 
 echo "=== [Paso 3/7] Multimodal Fusion (Target_Img_gen.py con CLIP) ==="
-python "${REPO_DIR}/MedFocusLeak/MultimodalFusion/Target_Img_gen.py" \
-    --csv_path "${MODIFIED_CSV}" \
-    --image_col images \
-    --text_col Findings_5 \
-    --output_dir "${WORK_DIR}/bsa_output/1" \
-    --model_name "openai/clip-vit-base-patch32" \
-    --eps 0.0627 \
-    --alpha 0.00392 \
-    --steps 100
+if [ -z "$(ls -A "${WORK_DIR}/bsa_output/1" 2>/dev/null)" ]; then
+    python "${REPO_DIR}/MedFocusLeak/MultimodalFusion/Target_Img_gen.py" \
+        --csv_path "${MODIFIED_CSV}" \
+        --image_col images \
+        --text_col Findings_5 \
+        --output_dir "${WORK_DIR}/bsa_output/1" \
+        --model_name "openai/clip-vit-base-patch32" \
+        --eps 0.0627 \
+        --alpha 0.00392 \
+        --steps 100
+else
+    echo "BSA output ya existe en ${WORK_DIR}/bsa_output/1, saltando Paso 3."
+fi
 
 echo "=== [Paso 4/7] Ensemble Adversarial Attack (Modified_mattack) ==="
 cd "${REPO_DIR}/MedFocusLeak/Modified_mattack"
@@ -87,20 +91,15 @@ python generate_adversarial_samples2.py \
     data.mask_data_path="${WORK_DIR}/masks" \
     data.output="${WORK_DIR}/output"
 
-# Copiar imagenes generadas en Paso 4 hacia la entrada del Paso 5
-cp -r "${WORK_DIR}/output/img/"*/* "${WORK_DIR}/attentionshift_imgs/1/"
+HASH_DIR=$(ls -d "${WORK_DIR}/output/img/"* | head -n 1)
 
 echo "=== [Paso 5/7] Attention-Shift Perturbation (run_attack2.py) ==="
 cd "${REPO_DIR}/MedFocusLeak/attentionshift"
 python run_attack2.py \
-    --image_dir "${WORK_DIR}/attentionshift_imgs" \
+    --image_dir "${HASH_DIR}" \
     --mask_dir "${WORK_DIR}/masks" \
-    --result_dir "${WORK_DIR}/attentionshift_results" \
+    --result_dir "${HASH_DIR}" \
     --num_steps 300
-
-# Reemplazar con las imagenes finales con attention-shift para evaluarlas en el Paso 6
-HASH_DIR=$(ls -d "${WORK_DIR}/output/img/"* | head -n 1)
-cp -r "${WORK_DIR}/attentionshift_results/"* "${HASH_DIR}/"
 
 echo "=== [Paso 6/7] Evaluando modelo victima Qwen/Qwen2.5-VL-7B-Instruct ==="
 cd "${REPO_DIR}/MedFocusLeak/Modified_mattack"
@@ -110,7 +109,6 @@ python blackbox_text_generation.py \
     data.mask_data_path="${WORK_DIR}/masks" \
     data.output="${WORK_DIR}/output" \
     blackbox.model_name="Qwen/Qwen2.5-VL-7B-Instruct"
-# Al terminar este comando, Qwen2.5-VL-7B-Instruct se descarga de la VRAM.
 
 echo "=== [Paso 7/7] Evaluando con Juez Qwen/Qwen3-32B (MTR Score) ==="
 python gpt_evaluate.py \

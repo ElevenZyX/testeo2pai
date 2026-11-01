@@ -1,13 +1,12 @@
 import torch
 from torch import nn, Tensor
 from abc import abstractmethod
-from typing import List, Any, Callable, Dict
+from typing import List, Any, Dict
 
 
 class BaseFeatureExtractor(nn.Module):
     def __init__(self):
         super(BaseFeatureExtractor, self).__init__()
-        pass
 
     @abstractmethod
     def forward(self, x: Tensor) -> Tensor:
@@ -19,14 +18,13 @@ class EnsembleFeatureExtractor(BaseFeatureExtractor):
         super(EnsembleFeatureExtractor, self).__init__()
         self.extractors = nn.ModuleList(extractors)
 
-    def forward(self, x: Tensor) -> Tensor:
-        # features = []
-        # for model in self.extractors:
-        #     features.append(model(x).squeeze())
-        # features = torch.cat(features, dim=0)
-        features = {}  # 不拼接，改为字典存储
+    def forward(self, x: Tensor) -> Dict[int, Tensor]:
+        features = {}
         for i, model in enumerate(self.extractors):
-            features[i] = model(x).squeeze()
+            feat = model(x)
+            if feat.dim() == 1:
+                feat = feat.unsqueeze(0)
+            features[i] = feat
         return features
 
 
@@ -40,15 +38,17 @@ class EnsembleFeatureLoss(nn.Module):
     def set_ground_truth(self, x: Tensor):
         self.ground_truth.clear()
         for model in self.extractors:
-            self.ground_truth.append(model(x).to(x.device))
+            gt = model(x).to(x.device)
+            if gt.dim() == 1:
+                gt = gt.unsqueeze(0)
+            self.ground_truth.append(gt)
 
     def __call__(self, feature_dict: Dict[int, Tensor], y: Any = None) -> Tensor:
         loss = 0
-        for index, model in enumerate(self.extractors):
+        for index, _ in enumerate(self.extractors):
             gt = self.ground_truth[index]
             feature = feature_dict[index]
-            loss += torch.mean(torch.sum(feature * gt, dim=1))
-            
-        loss = loss / len(self.extractors)
+            loss += torch.mean(torch.sum(feature * gt, dim=-1))
 
+        loss = loss / len(self.extractors)
         return loss
