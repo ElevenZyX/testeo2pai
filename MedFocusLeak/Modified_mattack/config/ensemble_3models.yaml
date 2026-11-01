@@ -1,4 +1,4 @@
-# Configuration for ensemble_3models.py
+# Configuration for ensemble_3models.py (Local Cluster Setup - A100 80GB)
 
 defaults:
   - _self_
@@ -6,9 +6,11 @@ defaults:
 data:
   batch_size: 1
   num_samples: 100
-  output: "./LAT"
+  output: "./img_output"
   cle_data_path: "resources/images/bigscale"
   tgt_data_path: "resources/images/target_images"
+  mask_data_path: "resources/images/masks"
+  modalities: ["Mammography", "MRI"]
 
 optim:
   alpha: 1.0
@@ -16,21 +18,32 @@ optim:
   steps: 300
 
 model:
-  input_res: 224
+  k: 10
+  non_overlap: true
+  input_res: 336
   use_source_crop: true
   use_target_crop: true
-  crop_scale: [0.5, 0.9] 
+  crop_scale: [0.5, 0.9]
   ensemble: true
-  device: "cuda:0"  # Using GPU 1
-  backbone: ["B16", "B32", "Laion"]  # Use all models in ensemble
+  device: "cuda:0"
+  backbone: ["L336", "B16", "B32", "Laion"]
 
 wandb:
-  project: "local_adversarial_attack"
-  entity: ??? # fill your wandb entity
+  enabled: false
+  project: "medfocusleak_local"
+  entity: null
 
 blackbox:
-  model_name: "gemini"  # Can be gpt4o, claude, gemini, gpt_4v
+  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  prompt: "Describe the clinical findings and abnormalities in this medical scan."
+  max_new_tokens: 256
   batch_size: 1
   timeout: 30
 
-attack: 'fgsm' # [fgsm, mifgsm, pgd]
+judge:
+  model_name: "Qwen/Qwen3-32B"
+  mode: "mtr"
+  alpha: 0.5
+  beta: 0.5
+
+attack: "fgsm" # [fgsm, mifgsm, pgd]

@@ -1,148 +1,108 @@
 import os
-import requests
+import json
+import shutil
+import pandas as pd
 from PIL import Image
-from typing import Dict, Any, List, Tuple
+from typing import List, Tuple, Optional
 import hydra
 import torch
-import torchvision
-from omegaconf import OmegaConf
 from tqdm import tqdm
-import wandb
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_random_exponential,
-)
-from config_schema import MainConfig
-from google import genai
-import openai
-from openai import OpenAI
-import anthropic
 
+from config_schema import MainConfig
 from utils import (
-    get_api_key,
     hash_training_config,
     setup_wandb,
+    log_wandb,
+    finish_wandb,
     ensure_dir,
-    encode_image,
     get_output_paths,
+    safe_model_tag,
 )
 
-# Define valid image extensions
 VALID_IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".JPEG"]
 
 
-def setup_gemini(api_key: str):
-    return genai.Client(api_key=api_key)
-
-
-def setup_claude(api_key: str):
-    return anthropic.Anthropic(api_key=api_key)
-
-
-def setup_gpt4o(api_key: str):
-    return OpenAI(
-        api_key=api_key,
-    )
-
-
-def get_media_type(image_path: str) -> str:
-    """Get the correct media type based on file extension."""
-    ext = os.path.splitext(image_path)[1].lower()
-    if ext in [".jpg", ".jpeg", ".jpeg"]:
-        return "image/jpeg"
-    elif ext == ".png":
-        return "image/png"
-    else:
-        raise ValueError(f"Unsupported image extension: {ext}")
-
-
 class ImageDescriptionGenerator:
-    def __init__(self, model_name: str):
+    """
+    Local Vision-Language Model evaluator using HuggingFace Transformers.
+    Default target model: Qwen/Qwen2.5-VL-7B-Instruct (no external API required).
+    """
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        prompt: str = "Describe the clinical findings and abnormalities in this medical scan.",
+        max_new_tokens: int = 256,
+    ):
         self.model_name = model_name
-        # Get API key for the model
-        api_key = get_api_key(model_name)
+        self.prompt = prompt
+        self.max_new_tokens = max_new_tokens
 
-        if model_name == "gemini":
-            self.client = setup_gemini(api_key)
-        elif model_name == "claude":
-            self.client = setup_claude(api_key)
-        elif model_name == "gpt4o":
-            self.client = setup_gpt4o(api_key)
-        else:
-            raise ValueError(f"Unsupported model: {model_name}")
+        print(f"[VLM Evaluator] Loading local VLM: {model_name} ...")
+        from transformers import AutoProcessor
 
-    def generate_description(self, image_path: str) -> str:
-        if self.model_name == "gemini":
-            return self._generate_gemini(image_path)
-        elif self.model_name == "claude":
-            return self._generate_claude(image_path)
-        elif self.model_name == "gpt4o":
-            return self._generate_gpt4o(image_path)
+        try:
+            from transformers import Qwen2_5_VLForConditionalGeneration as VLMClass
+        except ImportError:
+            from transformers import AutoModelForVision2Seq as VLMClass
 
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-    def _generate_gemini(self, image_path: str) -> str:
-        image = Image.open(image_path)
-        response = self.client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=["Describe this image, no longer than 25 words.", image],
+        self.processor = AutoProcessor.from_pretrained(
+            model_name,
+            trust_remote_code=True,
         )
-        return response.text.strip()
-
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-    def _generate_claude(self, image_path: str) -> str:
-        base64_image = encode_image(image_path)
-        media_type = get_media_type(image_path)
-        response = self.client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=300,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Describe this image in one concise sentence, no longer than 20 words.",
-                        },
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": base64_image,
-                            },
-                        },
-                    ],
-                }
-            ],
+        self.model = VLMClass.from_pretrained(
+            model_name,
+            torch_dtype="auto",
+            device_map="auto",
+            trust_remote_code=True,
         )
-        return response.content[0].text
+        self.model.eval()
+        print(f"[VLM Evaluator] Model {model_name} loaded successfully.")
 
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-    def _generate_gpt4o(self, image_path: str) -> str:
-        base64_image = encode_image(image_path)
-        response = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Describe this image in one concise sentence, no longer than 20 words.",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            },
-                        },
-                    ],
-                }
-            ],
-            max_tokens=100,
+    def generate_description(self, image_path: str, custom_prompt: Optional[str] = None) -> str:
+        prompt_text = custom_prompt or self.prompt
+        image = Image.open(image_path).convert("RGB")
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+
+        text_input = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
-        return response.choices[0].message.content
+        inputs = self.processor(
+            text=[text_input],
+            images=[image],
+            padding=True,
+            return_tensors="pt",
+        ).to(self.model.device)
+
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+            )
+
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_text = self.processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+        # Collapse newlines for single-line table compatibility while keeping full text
+        return " ".join(output_text.strip().splitlines())
 
 
 def save_descriptions(descriptions: List[Tuple[str, str]], output_file: str):
@@ -153,97 +113,142 @@ def save_descriptions(descriptions: List[Tuple[str, str]], output_file: str):
             f.write(f"{filename}: {desc}\n")
 
 
+def _find_matching_image(base_dir: str, subfolder: str, filename_base: str) -> Optional[str]:
+    """Find matching clean or target image across valid extensions and candidate subfolders."""
+    candidate_folders = [subfolder, "1", ""]
+    for folder in candidate_folders:
+        for ext in VALID_IMAGE_EXTENSIONS:
+            cand = os.path.join(base_dir, folder, filename_base + ext) if folder else os.path.join(base_dir, filename_base + ext)
+            if os.path.exists(cand):
+                return cand
+    return None
+
+
 @hydra.main(version_base=None, config_path="config", config_name="ensemble_3models")
 def main(cfg: MainConfig):
-    # Initialize wandb using shared utility
-    setup_wandb(cfg)
+    setup_wandb(cfg, tags=["vlm_evaluation"])
 
-    # Get config hash and setup paths
     config_hash = hash_training_config(cfg)
     print(f"Using training output for config hash: {config_hash}")
 
-    # Get output paths using shared utility
     paths = get_output_paths(cfg, config_hash)
     ensure_dir(paths["desc_output_dir"])
 
-    try:
-        # Initialize description generator
-        generator = ImageDescriptionGenerator(model_name=cfg.blackbox.model_name)
+    model_tag = safe_model_tag(cfg.blackbox.model_name)
+    allowed_modalities = (
+        [m.lower() for m in cfg.data.modalities]
+        if getattr(cfg.data, "modalities", None)
+        else None
+    )
 
-        # Process original and adversarial images
+    try:
+        generator = ImageDescriptionGenerator(
+            model_name=cfg.blackbox.model_name,
+            prompt=getattr(
+                cfg.blackbox,
+                "prompt",
+                "Describe the clinical findings and abnormalities in this medical scan.",
+            ),
+            max_new_tokens=getattr(cfg.blackbox, "max_new_tokens", 256),
+        )
+
         tgt_descriptions = []
         adv_descriptions = []
+        export_records = []
 
-        # Walk through the output directory for adversarial images
-        print("Processing images...")
+        # Create export bundle directory for easy download of images + text from cluster
+        export_dir = os.path.join(cfg.data.output, "export_bundle", config_hash)
+        export_clean_img_dir = os.path.join(export_dir, "clean_images")
+        export_adv_img_dir = os.path.join(export_dir, "adversarial_images")
+        ensure_dir(export_clean_img_dir)
+        ensure_dir(export_adv_img_dir)
+
+        print("Processing images with local VLM...")
         for root, _, files in os.walk(paths["output_dir"]):
-            for file in tqdm(files):
-                # Check if file has valid image extension
-                if any(
-                    file.lower().endswith(ext.lower()) for ext in VALID_IMAGE_EXTENSIONS
-                ):
+            subfolder = os.path.basename(root)
+            # If modalities filter is set and subfolder explicitly names a modality, filter it
+            if (
+                allowed_modalities
+                and subfolder.lower() not in allowed_modalities
+                and subfolder.lower() not in ["1", "nips17", os.path.basename(paths["output_dir"]).lower()]
+            ):
+                print(f"Skipping modality folder '{subfolder}' (allowed: {cfg.data.modalities})")
+                continue
+
+            for file in tqdm(sorted(files), desc=f"Folder: {subfolder}"):
+                if any(file.lower().endswith(ext.lower()) for ext in VALID_IMAGE_EXTENSIONS):
                     try:
-                        # Get paths
                         adv_path = os.path.join(root, file)
-                        # Extract just the filename without extension
                         filename_base = os.path.splitext(os.path.basename(adv_path))[0]
 
-                        # Try each valid extension for target image
-                        target_found = False
-                        for ext in VALID_IMAGE_EXTENSIONS:
-                            tgt_path = os.path.join(
-                                cfg.data.tgt_data_path, "1", filename_base + ext
-                            )
-                            if os.path.exists(tgt_path):
-                                target_found = True
-                                break
+                        # Prefer clean source image for y_clean (Paper Section A.6), fallback to target image
+                        ref_path = _find_matching_image(cfg.data.cle_data_path, subfolder, filename_base)
+                        if ref_path is None:
+                            ref_path = _find_matching_image(cfg.data.tgt_data_path, subfolder, filename_base)
 
-                        if target_found:
-                            # Generate descriptions
-                            tgt_desc = generator.generate_description(tgt_path)
+                        if ref_path is not None:
+                            clean_desc = generator.generate_description(ref_path)
                             adv_desc = generator.generate_description(adv_path)
 
-                            tgt_descriptions.append((file, tgt_desc))
-                            adv_descriptions.append((file, adv_desc))
+                            rel_key = f"{subfolder}/{file}" if subfolder != os.path.basename(paths["output_dir"]) else file
+                            tgt_descriptions.append((rel_key, clean_desc))
+                            adv_descriptions.append((rel_key, adv_desc))
 
-                            # Log to wandb
-                            wandb.log(
+                            # Copy images into export_bundle for easy download
+                            ensure_dir(os.path.join(export_clean_img_dir, subfolder))
+                            ensure_dir(os.path.join(export_adv_img_dir, subfolder))
+                            exported_clean = os.path.join(export_clean_img_dir, subfolder, os.path.basename(ref_path))
+                            exported_adv = os.path.join(export_adv_img_dir, subfolder, file)
+                            shutil.copy2(ref_path, exported_clean)
+                            shutil.copy2(adv_path, exported_adv)
+
+                            export_records.append(
                                 {
-                                    f"descriptions/{file}/target": tgt_desc,
-                                    f"descriptions/{file}/adversarial": adv_desc,
+                                    "id": rel_key,
+                                    "modality": subfolder,
+                                    "clean_image_path": exported_clean,
+                                    "adversarial_image_path": exported_adv,
+                                    "clean_findings": clean_desc,
+                                    "adversarial_findings": adv_desc,
                                 }
                             )
 
-                        else:
-                            print(
-                                f"Target image not found for {filename_base} with any valid extension, skip it."
+                            log_wandb(
+                                cfg,
+                                {
+                                    f"descriptions/{rel_key}/clean": clean_desc,
+                                    f"descriptions/{rel_key}/adversarial": adv_desc,
+                                },
                             )
+                        else:
+                            print(f"Reference image not found for {filename_base}, skipping.")
 
                     except Exception as e:
                         print(f"Error processing {file}: {e}")
 
-        # Save descriptions
+        # Save descriptions in txt format for judge evaluation
         save_descriptions(
             tgt_descriptions,
-            os.path.join(
-                paths["desc_output_dir"], f"target_{cfg.blackbox.model_name}.txt"
-            ),
+            os.path.join(paths["desc_output_dir"], f"target_{model_tag}.txt"),
         )
         save_descriptions(
             adv_descriptions,
-            os.path.join(
-                paths["desc_output_dir"], f"adversarial_{cfg.blackbox.model_name}.txt"
-            ),
+            os.path.join(paths["desc_output_dir"], f"adversarial_{model_tag}.txt"),
         )
+
+        # Save downloadable CSV and JSON with image paths + generated texts
+        if export_records:
+            export_csv = os.path.join(export_dir, f"vlm_generations_{model_tag}.csv")
+            export_json = os.path.join(export_dir, f"vlm_generations_{model_tag}.json")
+            pd.DataFrame(export_records).to_csv(export_csv, index=False)
+            with open(export_json, "w", encoding="utf-8") as f:
+                json.dump(export_records, f, indent=2, ensure_ascii=False)
+            print(f"Export bundle (images + text) saved to: {export_dir}")
 
         print(f"Descriptions saved to {paths['desc_output_dir']}")
 
-    except (FileNotFoundError, KeyError) as e:
-        print(f"Error: {e}")
-        return
-
     finally:
-        wandb.finish()
+        finish_wandb(cfg)
 
 
 if __name__ == "__main__":
